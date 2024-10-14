@@ -7,3 +7,9 @@ datasets/
 humanoid/
 
 experiments*/
+
+amass_data/
+pulse_data/
+temp_data/
+
+*.pkl

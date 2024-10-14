@@ -8,6 +8,7 @@ from rl_games.algos_torch import torch_ext
 from easydict import EasyDict as edict
 
 import os
+from os.path import join
 import time
 import sys
 sys.path.insert(0, os.getcwd())
@@ -20,6 +21,39 @@ from omegaconf import OmegaConf
 
 from confimo.config import parse_args
 from confimo.data.get_data import get_dataset
+
+from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot as LocalRobot
+from smpl_sim.smpllib.smpl_joint_names import SMPL_MUJOCO_NAMES, SMPL_BONE_ORDER_NAMES
+from scipy.spatial.transform import Rotation as sRot
+from poselib.poselib.skeleton.skeleton3d import SkeletonTree, SkeletonMotion, SkeletonState
+import joblib
+
+import pandas as pd
+
+from phc.env.tasks.humanoid_z import HumanoidZ
+
+upright_start = True
+robot_cfg = {
+        "mesh": False,
+        "rel_joint_lm": True,
+        "upright_start": upright_start,
+        "remove_toe": False,
+        "real_weight": True,
+        "real_weight_porpotion_capsules": True,
+        "real_weight_porpotion_boxes": True, 
+        "replace_feet": True,
+        "masterfoot": False,
+        "big_ankle": True,
+        "freeze_hand": False, 
+        "box_body": False,
+        "master_range": 50,
+        "body_params": {},
+        "joint_params": {},
+        "geom_params": {},
+        "actuator_params": {},
+        "model": "smpl",
+    }
+smpl_local_robot = LocalRobot(robot_cfg,)
 
 
 def set_seed(seed: int) -> None:
@@ -161,7 +195,205 @@ def load_encoder_decoder():
     decoder = load_decoder(checkpoint, device)
 
     logger.info(f"encoder:\n{encoder}\ndecoder:\n{decoder}")
+    return encoder, decoder
+
+
+def store_motion(src_path, mirror=True):
+
+    entry_data = dict(np.load(open(src_path, "rb"), allow_pickle=True))
+
+    framerate = entry_data['mocap_framerate']
+    skip = int(framerate/30)
+
+    root_trans = entry_data['trans'][::skip, :]
+    pose_aa = np.concatenate([entry_data['poses'][::skip, :66], np.zeros((root_trans.shape[0], 6))], axis = -1)
+    betas = entry_data['betas']
+    gender = entry_data['gender']
+    N = pose_aa.shape[0]
+
+    smpl_2_mujoco = [SMPL_BONE_ORDER_NAMES.index(q) for q in SMPL_MUJOCO_NAMES if q in SMPL_BONE_ORDER_NAMES]
+    pose_aa_mj = pose_aa.reshape(N, 24, 3)[:, smpl_2_mujoco]
+    pose_quat = sRot.from_rotvec(pose_aa_mj.reshape(-1, 3)).as_quat().reshape(N, 24, 4)
+
+    beta = np.zeros((16))
+    gender_number, beta[:], gender = [0], 0, "neutral"
+
+    smpl_local_robot.load_from_skeleton(betas=torch.from_numpy(beta[None,]), gender=gender_number, objs_info=None)
+    smpl_local_robot.write_xml(f"data/assets/mjcf/{robot_cfg['model']}_humanoid.xml")
+    skeleton_tree = SkeletonTree.from_mjcf(f"data/assets/mjcf/{robot_cfg['model']}_humanoid.xml")
+    root_trans_offset = torch.from_numpy(root_trans) + skeleton_tree.local_translation[0]
+    
+    new_sk_state = SkeletonState.from_rotation_and_root_translation(
+                skeleton_tree,  # This is the wrong skeleton tree (location wise) here, but it's fine since we only use the parent relationship here. 
+                torch.from_numpy(pose_quat),
+                root_trans_offset,
+                is_local=True)
+    
+    if robot_cfg['upright_start']:
+        pose_quat_global = (sRot.from_quat(new_sk_state.global_rotation.reshape(-1, 4).numpy()) * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()).as_quat().reshape(N, -1, 4)  # should fix pose_quat as well here...
+
+        new_sk_state = SkeletonState.from_rotation_and_root_translation(skeleton_tree, torch.from_numpy(pose_quat_global), root_trans_offset, is_local=False)
+        pose_quat = new_sk_state.local_rotation.numpy()
+    
+    pose_quat_global = new_sk_state.global_rotation.numpy()
+    pose_quat = new_sk_state.local_rotation.numpy()
+    fps = 30
+
+    new_motion_out = {}
+    new_motion_out['pose_quat_global'] = pose_quat_global
+    new_motion_out['pose_quat'] = pose_quat
+    new_motion_out['trans_orig'] = root_trans
+    new_motion_out['root_trans_offset'] = root_trans_offset
+    new_motion_out['beta'] = beta
+    new_motion_out['gender'] = gender
+    new_motion_out['pose_aa'] = pose_aa
+    new_motion_out['fps'] = fps
+
+    if mirror:
+
+        left_to_right_index = [0, 5, 6, 7, 8, 1, 2, 3, 4, 9, 10, 11, 12, 13, 19, 20, 21, 22, 23, 14, 15, 16, 17, 18]
+        
+        pose_quat_global = pose_quat_global[:, left_to_right_index]
+        pose_quat_global[..., 0] *= -1
+        pose_quat_global[..., 2] *= -1
+
+        pose_quat = pose_quat[:, left_to_right_index]
+        pose_quat[..., 0] *= -1
+        pose_quat[..., 2] *= -1
+
+        root_trans[..., 1] *= -1
+        root_trans_offset[..., 1] *= -1
+
+        pose_aa = pose_aa[:, left_to_right_index]
+        pose_aa[..., 1] *= -1
+
+        M_new_motion_out = {}
+        M_new_motion_out['pose_quat_global'] = pose_quat_global
+        M_new_motion_out['pose_quat'] = pose_quat
+        M_new_motion_out['trans_orig'] = root_trans
+        M_new_motion_out['root_trans_offset'] = root_trans_offset
+        M_new_motion_out['beta'] = beta
+        M_new_motion_out['gender'] = gender
+        M_new_motion_out['pose_aa'] = pose_aa
+        M_new_motion_out['fps'] = fps
+    
+    return new_motion_out, M_new_motion_out
+
+
+def store_motion_humanact12(src_path, mirror=True):
+
+    entry_data = joblib.load(src_path)
+
+    skip = 1
+
+    # trans_matrix = np.array(
+    #     [[0, 1, 0], 
+    #     [0, 0, -1], 
+    #     [1, 0, 0]]
+    # )
+    trans_matrix = np.array(
+        [[1, 0, 0], 
+        [0, 1, 0], 
+        [0, 0, 1]]
+    )
+    root_trans = np.dot(entry_data['cam'][::skip, :], trans_matrix)
+    pose_aa = np.concatenate([entry_data['pose'][::skip, :66], np.zeros((root_trans.shape[0], 6))], axis = -1)
+    betas = entry_data['beta']
+    N = pose_aa.shape[0]
+
+    smpl_2_mujoco = [SMPL_BONE_ORDER_NAMES.index(q) for q in SMPL_MUJOCO_NAMES if q in SMPL_BONE_ORDER_NAMES]
+    pose_aa_mj = pose_aa.reshape(N, 24, 3)[:, smpl_2_mujoco]
+    pose_quat = sRot.from_rotvec(pose_aa_mj.reshape(-1, 3)).as_quat().reshape(N, 24, 4)
+
+    beta = np.zeros((16))
+    gender_number, beta[:], gender = [0], 0, "neutral"
+
+    smpl_local_robot.load_from_skeleton(betas=torch.from_numpy(beta[None,]), gender=gender_number, objs_info=None)
+    smpl_local_robot.write_xml(f"data/assets/mjcf/{robot_cfg['model']}_humanoid.xml")
+    skeleton_tree = SkeletonTree.from_mjcf(f"data/assets/mjcf/{robot_cfg['model']}_humanoid.xml")
+    root_trans_offset = torch.from_numpy(root_trans) + skeleton_tree.local_translation[0]
+    
+    new_sk_state = SkeletonState.from_rotation_and_root_translation(
+                skeleton_tree,  # This is the wrong skeleton tree (location wise) here, but it's fine since we only use the parent relationship here. 
+                torch.from_numpy(pose_quat),
+                root_trans_offset,
+                is_local=True)
+    
+    if robot_cfg['upright_start']:
+        pose_quat_global = (sRot.from_quat(new_sk_state.global_rotation.reshape(-1, 4).numpy()) * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()).as_quat().reshape(N, -1, 4)  # should fix pose_quat as well here...
+
+        new_sk_state = SkeletonState.from_rotation_and_root_translation(skeleton_tree, torch.from_numpy(pose_quat_global), root_trans_offset, is_local=False)
+        pose_quat = new_sk_state.local_rotation.numpy()
+    
+    pose_quat_global = new_sk_state.global_rotation.numpy()
+    pose_quat = new_sk_state.local_rotation.numpy()
+    fps = 30    # Here it actually 20 fps, we ignore it for avoiding potential puzzles further.
+
+    new_motion_out = {}
+    new_motion_out['pose_quat_global'] = pose_quat_global
+    new_motion_out['pose_quat'] = pose_quat
+    new_motion_out['trans_orig'] = root_trans
+    new_motion_out['root_trans_offset'] = root_trans_offset
+    new_motion_out['beta'] = beta
+    new_motion_out['gender'] = gender
+    new_motion_out['pose_aa'] = pose_aa
+    new_motion_out['fps'] = fps
+
+    if mirror:
+
+        left_to_right_index = [0, 5, 6, 7, 8, 1, 2, 3, 4, 9, 10, 11, 12, 13, 19, 20, 21, 22, 23, 14, 15, 16, 17, 18]
+        
+        pose_quat_global = pose_quat_global[:, left_to_right_index]
+        pose_quat_global[..., 0] *= -1
+        pose_quat_global[..., 2] *= -1
+
+        pose_quat = pose_quat[:, left_to_right_index]
+        pose_quat[..., 0] *= -1
+        pose_quat[..., 2] *= -1
+
+        root_trans[..., 1] *= -1
+        root_trans_offset[..., 1] *= -1
+
+        pose_aa = pose_aa[:, left_to_right_index]
+        pose_aa[..., 1] *= -1
+
+        M_new_motion_out = {}
+        M_new_motion_out['pose_quat_global'] = pose_quat_global
+        M_new_motion_out['pose_quat'] = pose_quat
+        M_new_motion_out['trans_orig'] = root_trans
+        M_new_motion_out['root_trans_offset'] = root_trans_offset
+        M_new_motion_out['beta'] = beta
+        M_new_motion_out['gender'] = gender
+        M_new_motion_out['pose_aa'] = pose_aa
+        M_new_motion_out['fps'] = fps
+    
+    return new_motion_out, M_new_motion_out
 
 
 if __name__ == "__main__":
-    load_encoder_decoder()
+
+    tgt_dir_name = '/ailab/user/henantian/code/ConFiMo/pulse_data'
+    os.makedirs(tgt_dir_name, exist_ok=True)
+
+    index_file = pd.read_csv('/ailab/user/henantian/code/ConFiMo/index.csv')
+    total_amount = index_file.shape[0]
+
+    for i in tqdm(range(total_amount)):
+        src_path = index_file.loc[i]['source_path']
+        tgt_file_name = index_file.loc[i]['new_name'].replace('.npy', '.pkl')
+        if "humanact12" in src_path:
+            src_path = src_path.replace('pose_data', 'amass_data').replace('.npy', '.pkl')
+            new_motion_out, M_new_motion_out = store_motion_humanact12(src_path)
+        else:
+            continue    # Below has been excuted before
+            src_path = index_file.loc[i]['source_path'].replace('pose_data', 'amass_data').replace('.npy', '.npz')
+            new_motion_out, M_new_motion_out = store_motion(src_path)
+        
+        joblib.dump(new_motion_out, join(tgt_dir_name, tgt_file_name))
+        joblib.dump(M_new_motion_out, join(tgt_dir_name, "M" + tgt_file_name))
+    
+
+
+
+
+
