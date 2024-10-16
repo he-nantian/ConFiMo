@@ -1,5 +1,3 @@
-
-
 import numpy as np
 import os
 import yaml
@@ -80,6 +78,7 @@ class MotionLibSMPL(MotionLibBase):
             betas = curr_gender_betas[1:]
             mesh_parser = mesh_parsers[gender.item()]
             height_tolorance = 0.0
+            # print(pose_aa.shape, trans.shape)
             vertices_curr, joints_curr = mesh_parser.get_joints_verts(pose_aa[:frame_check], betas[None,], trans[:frame_check])
             
             offset = joints_curr[:, 0] - trans[:frame_check] # account for SMPL root offset. since the root trans we pass in has been processed, we have to "add it back".
@@ -111,7 +110,7 @@ class MotionLibSMPL(MotionLibBase):
             curr_file = motion_data_list[f]
             if not isinstance(curr_file, dict) and osp.isfile(curr_file):
                 key = motion_data_list[f].split("/")[-1].split(".")[0]
-                curr_file = joblib.load(curr_file)[key]
+                curr_file = joblib.load(curr_file)
             curr_gender_beta = shape_params[f]
 
             seq_len = curr_file['root_trans_offset'].shape[0]
@@ -123,8 +122,12 @@ class MotionLibSMPL(MotionLibBase):
 
             trans = curr_file['root_trans_offset'].clone()[start:end]
             pose_aa = to_torch(curr_file['pose_aa'][start:end])
+            # print("\n\n\n\n\n")
+            # print(motion_data_list[f], pose_aa.shape, trans.shape)
+            # print("\n\n\n\n\n")
             pose_quat_global = curr_file['pose_quat_global'][start:end]
             
+            # import pdb; pdb.set_trace()
 
             B, J, N = pose_quat_global.shape
 
@@ -166,8 +169,6 @@ class MotionLibSMPL(MotionLibBase):
             curr_motion.gender_beta = curr_gender_beta
             res[curr_id] = (curr_file, curr_motion)
             
-            
-
         if not queue is None:
             queue.put(res)
         else:

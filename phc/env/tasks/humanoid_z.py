@@ -15,6 +15,13 @@ from easydict import EasyDict
 
 HACK_MOTION_SYNC = False
 
+# training PULSE: 
+# python phc/run_hydra.py env.task=HumanoidImDistillGetup env=env_im_vae \
+#   exp_name=pulse_vae robot.real_weight_porpotion_boxes=False learning=im_z_fit \
+#       env.models=['output/HumanoidIm/phc_3/Humanoid_00258000.pth','output/HumanoidIm/phc_comp_3/Humanoid_00023501.pth'] \
+#           env.motion_file=[insert data pkl] \
+#               epoch=-1 test=True env.num_envs=1  headless=False no_virtual_display=True
+
 class HumanoidZ(humanoid.Humanoid):
 
     def initialize_z_models(self, encoder, decoder):
@@ -166,9 +173,44 @@ class HumanoidZ(humanoid.Humanoid):
             self.gym.fetch_results(self.sim, True)
 
         # compute observations, rewards, resets, ...
-        self.post_physics_step()
+        self.obs_buf = self.post_physics_step()
+
+        # if self.dr_randomizations.get('observations', None):
+        #     self.obs_buf = self.dr_randomizations['observations']['noise_lambda'](self.obs_buf)
         
+        return 
 
-        if self.dr_randomizations.get('observations', None):
-            self.obs_buf = self.dr_randomizations['observations']['noise_lambda'](self.obs_buf)
 
+    def _set_env_state(
+        self,
+        env_ids,
+        root_pos,
+        root_rot,
+        dof_pos,
+        root_vel,
+        root_ang_vel,
+        dof_vel,
+        rigid_body_pos=None,
+        rigid_body_rot=None,
+        rigid_body_vel=None,
+        rigid_body_ang_vel=None,
+    ):
+        self._humanoid_root_states[env_ids, 0:3] = root_pos
+        self._humanoid_root_states[env_ids, 3:7] = root_rot
+        self._humanoid_root_states[env_ids, 7:10] = root_vel
+        self._humanoid_root_states[env_ids, 10:13] = root_ang_vel
+        self._dof_pos[env_ids] = dof_pos
+        self._dof_vel[env_ids] = dof_vel
+
+        if (not rigid_body_pos is None) and (not rigid_body_rot is None):
+            self._rigid_body_pos[env_ids] = rigid_body_pos
+            self._rigid_body_rot[env_ids] = rigid_body_rot
+            self._rigid_body_vel[env_ids] = rigid_body_vel
+            self._rigid_body_ang_vel[env_ids] = rigid_body_ang_vel
+
+            self._reset_rb_pos = self._rigid_body_pos[env_ids].clone()
+            self._reset_rb_rot = self._rigid_body_rot[env_ids].clone()
+            self._reset_rb_vel = self._rigid_body_vel[env_ids].clone()
+            self._reset_rb_ang_vel = self._rigid_body_ang_vel[env_ids].clone()
+            
+        return

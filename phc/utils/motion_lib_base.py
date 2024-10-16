@@ -176,7 +176,7 @@ class MotionLibBase():
     def fix_trans_height(pose_aa, trans, curr_gender_betas, mesh_parsers, fix_height_mode):
         raise NotImplementedError
 
-    def load_motions(self, skeleton_trees, gender_betas, limb_weights, random_sample=True, start_idx=0, max_len=-1):
+    def load_motions(self, skeleton_trees, gender_betas, limb_weights, random_sample=True, start_idx=0, max_len=-1, num_jobs=6):
         # load motion load the same number of motions as there are skeletons (humanoids)
         if "gts" in self.__dict__:
             del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs,
@@ -227,12 +227,6 @@ class MotionLibBase():
 
         manager = mp.Manager()
         queue = manager.Queue()
-        num_jobs = min(mp.cpu_count(), 64)
-
-        if num_jobs <= 8 or not self.multi_thread:
-            num_jobs = 1
-        if flags.debug:
-            num_jobs = 1
         
         res_acc = {}  # using dictionary ensures order of the results.
         jobs = motion_data_list

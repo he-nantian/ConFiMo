@@ -528,17 +528,17 @@ class Humanoid(BaseTask):
         if (env_ids is None):
             env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
         
-        self._reset_envs(env_ids)
+        self.obs_buf = self._reset_envs(env_ids)
 
         if safe_reset:
             # import ipdb; ipdb.set_trace()
             # print("3resetting here!!!!", self._humanoid_root_states[0, :3] - self._rigid_body_pos[0, 0])
             # ZL: This way it will simuate one step, then get reset again, squashing any remaining wiredness. Temporary fix
             self.gym.simulate(self.sim)
-            self._reset_envs(env_ids)
+            self.obs_buf = self._reset_envs(env_ids)
             torch.cuda.empty_cache()
 
-        return
+        return 
     
     def change_char_color(self):
         colors = []
@@ -581,10 +581,10 @@ class Humanoid(BaseTask):
             if self.self_obs_v == 2:
                 self._init_tensor_history(env_ids)
             
-            self._compute_observations(env_ids)
+            obs = self._compute_observations(env_ids)
         
         
-        return
+        return obs
 
     def _reset_env_tensors(self, env_ids):
         env_ids_int32 = self._humanoid_actor_ids[env_ids]
@@ -1132,7 +1132,7 @@ class Humanoid(BaseTask):
     def _compute_observations(self, env_ids=None):
         obs = self._compute_humanoid_obs(env_ids)
 
-        return
+        return obs
 
     def _compute_humanoid_obs(self, env_ids=None):
         if (ENABLE_MAX_COORD_OBS):
@@ -1325,7 +1325,7 @@ class Humanoid(BaseTask):
         self._compute_reward(self.actions)  # ZL swapped order of reward & objecation computes. should be fine.
         self._compute_reset() 
         
-        self._compute_observations()  # observation for the next step.
+        obs = self._compute_observations()  # observation for the next step.
 
         self.extras["terminate"] = self._terminate_buf
         self.extras["reward_raw"] = self.reward_raw.detach()
@@ -1343,7 +1343,7 @@ class Humanoid(BaseTask):
         #     print(sorted_speed.numpy()[::-1][:20], sorted_idx.numpy()[::-1][:20].tolist())
         #     # import ipdb; ipdb.set_trace()
 
-        return
+        return obs
 
     def render(self, sync_frame_time=False):
         if self.viewer or flags.server_mode:

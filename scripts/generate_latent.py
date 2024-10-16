@@ -1,3 +1,4 @@
+import isaacgym
 import numpy as np
 import random
 import torch
@@ -32,6 +33,21 @@ import pandas as pd
 
 from phc.env.tasks.humanoid_z import HumanoidZ
 
+from isaacgym import gymapi
+from isaacgym import gymutil
+from phc.utils.config import SIM_TIMESTEP
+
+from phc.utils.flags import flags
+
+from phc.utils.motion_lib_smpl import MotionLibSMPL
+from easydict import EasyDict
+from phc.utils.motion_lib_base import FixHeightMode
+
+from pdb import set_trace as st
+from phc.utils import torch_utils
+from isaacgym.torch_utils import *
+
+
 upright_start = True
 robot_cfg = {
         "mesh": False,
@@ -60,6 +76,41 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def parse_sim_params(cfg):
+    # initialize sim
+    sim_params = gymapi.SimParams()
+    sim_params.dt = SIM_TIMESTEP
+    sim_params.num_client_threads = cfg.sim.slices
+    
+    if cfg.sim.use_flex:
+        if cfg.sim.pipeline in ["gpu"]:
+            print("WARNING: Using Flex with GPU instead of PHYSX!")
+        sim_params.use_flex.shape_collision_margin = 0.01
+        sim_params.use_flex.num_outer_iterations = 4
+        sim_params.use_flex.num_inner_iterations = 10
+    else : # use gymapi.SIM_PHYSX
+        sim_params.physx.solver_type = 1
+        sim_params.physx.num_position_iterations = 4
+        sim_params.physx.num_velocity_iterations = 1
+        sim_params.physx.num_threads = 4
+        sim_params.physx.use_gpu = cfg.sim.pipeline in ["gpu"]
+        sim_params.physx.num_subscenes = cfg.sim.subscenes
+        sim_params.physx.max_gpu_contact_pairs = 4 * 1024 * 1024
+        
+    sim_params.use_gpu_pipeline = cfg.sim.pipeline in ["gpu"]
+    sim_params.physx.use_gpu = cfg.sim.pipeline in ["gpu"]
+
+    # if sim options are provided in cfg, parse them and update/override above:
+    if "sim" in cfg:
+        gymutil.parse_sim_config(cfg["sim"], sim_params)
+
+    # Override num_threads if passed on the command line
+    if not cfg.sim.use_flex and cfg.sim.physx.num_threads > 0:
+        sim_params.physx.num_threads = cfg.sim.physx.num_threads
+    
+    return sim_params
 
 
 def load_mlp(loading_keys, checkpoint, actvation_func):
@@ -153,7 +204,7 @@ def load_decoder(checkpoint, device):
     return decoder
 
 
-def load_encoder_decoder():
+def load_encoder_decoder(cfg, device):
 
     ######## dimension of PULSE ########
     # s^p: 358    s^g: 576    z: 32    a: 69
@@ -166,29 +217,6 @@ def load_encoder_decoder():
     # decoder:                   390 --> 69
     # z_prior:                   358 --> 512
     # z_prior_mu/z_prior_logvar: 512 --> 32
-
-    cfg = parse_args()
-    if cfg.vis_gpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = cfg.vis_gpu
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    
-    set_seed(cfg.TEST.SEED_VALUE)
-
-    name_time_str = osp.join(cfg.NAME, datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S"))
-    output_dir = osp.join(cfg.FOLDER, name_time_str)
-    os.makedirs(output_dir, exist_ok=False)
-
-    steam_handler = logging.StreamHandler(sys.stdout)
-    file_handler = logging.FileHandler(osp.join(output_dir, 'output.log'))
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-                        datefmt="%m/%d/%Y %H:%M:%S",
-                        handlers=[steam_handler, file_handler])
-    logger = logging.getLogger(__name__)
-
-    OmegaConf.save(cfg, osp.join(output_dir, 'config.yaml'))
-
-    logger.info(f"device: {device}")
 
     checkpoint = torch_ext.load_checkpoint(cfg.model.checkpoint_path)
     encoder = load_encoder(checkpoint, device)
@@ -264,8 +292,9 @@ def store_motion(src_path, mirror=True):
         root_trans[..., 1] *= -1
         root_trans_offset[..., 1] *= -1
 
-        pose_aa = pose_aa[:, left_to_right_index]
+        pose_aa = pose_aa.reshape(N, 24, 3)[:, left_to_right_index]
         pose_aa[..., 1] *= -1
+        pose_aa = pose_aa.reshape(N, 72)
 
         M_new_motion_out = {}
         M_new_motion_out['pose_quat_global'] = pose_quat_global
@@ -339,6 +368,8 @@ def store_motion_humanact12(src_path, mirror=True):
     new_motion_out['pose_aa'] = pose_aa
     new_motion_out['fps'] = fps
 
+    # st()
+
     if mirror:
 
         left_to_right_index = [0, 5, 6, 7, 8, 1, 2, 3, 4, 9, 10, 11, 12, 13, 19, 20, 21, 22, 23, 14, 15, 16, 17, 18]
@@ -354,8 +385,9 @@ def store_motion_humanact12(src_path, mirror=True):
         root_trans[..., 1] *= -1
         root_trans_offset[..., 1] *= -1
 
-        pose_aa = pose_aa[:, left_to_right_index]
+        pose_aa = pose_aa.reshape(N, 24, 3)[:, left_to_right_index]
         pose_aa[..., 1] *= -1
+        pose_aa = pose_aa.reshape(N, 72)
 
         M_new_motion_out = {}
         M_new_motion_out['pose_quat_global'] = pose_quat_global
@@ -370,30 +402,299 @@ def store_motion_humanact12(src_path, mirror=True):
     return new_motion_out, M_new_motion_out
 
 
-if __name__ == "__main__":
+def remove_base_rot(quat):
+    base_rot = quat_conjugate(torch.tensor([[0.5, 0.5, 0.5, 0.5]]).to(quat)) #SMPL
+    shape = quat.shape[0]
+    return quat_mul(quat, base_rot.repeat(shape, 1))
 
-    tgt_dir_name = '/ailab/user/henantian/code/ConFiMo/pulse_data'
-    os.makedirs(tgt_dir_name, exist_ok=True)
 
-    index_file = pd.read_csv('/ailab/user/henantian/code/ConFiMo/index.csv')
-    total_amount = index_file.shape[0]
+def compute_obs(body_pos, body_rot, body_vel, body_ang_vel, smpl_params, limb_weight_params, local_root_obs, root_height_obs, upright, has_smpl_params, has_limb_weight_params):
+    root_pos = body_pos[:, 0, :]
+    root_rot = body_rot[:, 0, :]
 
-    for i in tqdm(range(total_amount)):
-        src_path = index_file.loc[i]['source_path']
-        tgt_file_name = index_file.loc[i]['new_name'].replace('.npy', '.pkl')
-        if "humanact12" in src_path:
-            src_path = src_path.replace('pose_data', 'amass_data').replace('.npy', '.pkl')
-            new_motion_out, M_new_motion_out = store_motion_humanact12(src_path)
-        else:
-            continue    # Below has been excuted before
-            src_path = index_file.loc[i]['source_path'].replace('pose_data', 'amass_data').replace('.npy', '.npz')
-            new_motion_out, M_new_motion_out = store_motion(src_path)
+    root_h = root_pos[:, 2:3]
+    if not upright:
+        root_rot = remove_base_rot(root_rot)
+    heading_rot_inv = torch_utils.calc_heading_quat_inv(root_rot)
+
+    if (not root_height_obs):
+        root_h_obs = torch.zeros_like(root_h)
+    else:
+        root_h_obs = root_h
+
+    heading_rot_inv_expand = heading_rot_inv.unsqueeze(-2)
+    heading_rot_inv_expand = heading_rot_inv_expand.repeat((1, body_pos.shape[1], 1))
+    flat_heading_rot_inv = heading_rot_inv_expand.reshape(heading_rot_inv_expand.shape[0] * heading_rot_inv_expand.shape[1], heading_rot_inv_expand.shape[2])
+
+    root_pos_expand = root_pos.unsqueeze(-2)
+    local_body_pos = body_pos - root_pos_expand
+    flat_local_body_pos = local_body_pos.reshape(local_body_pos.shape[0] * local_body_pos.shape[1], local_body_pos.shape[2])
+    flat_local_body_pos = torch_utils.my_quat_rotate(flat_heading_rot_inv, flat_local_body_pos)
+    local_body_pos = flat_local_body_pos.reshape(local_body_pos.shape[0], local_body_pos.shape[1] * local_body_pos.shape[2])
+    local_body_pos = local_body_pos[..., 3:]  # remove root pos
+
+    flat_body_rot = body_rot.reshape(body_rot.shape[0] * body_rot.shape[1], body_rot.shape[2])  # This is global rotation of the body
+    flat_local_body_rot = quat_mul(flat_heading_rot_inv, flat_body_rot)
+    flat_local_body_rot_obs = torch_utils.quat_to_tan_norm(flat_local_body_rot)
+    local_body_rot_obs = flat_local_body_rot_obs.reshape(body_rot.shape[0], body_rot.shape[1] * flat_local_body_rot_obs.shape[1])
+
+    if not (local_root_obs):
+        root_rot_obs = torch_utils.quat_to_tan_norm(root_rot) # If not local root obs, you override it. 
+        local_body_rot_obs[..., 0:6] = root_rot_obs
+
+    flat_body_vel = body_vel.reshape(body_vel.shape[0] * body_vel.shape[1], body_vel.shape[2])
+    flat_local_body_vel = torch_utils.my_quat_rotate(flat_heading_rot_inv, flat_body_vel)
+    local_body_vel = flat_local_body_vel.reshape(body_vel.shape[0], body_vel.shape[1] * body_vel.shape[2])
+
+    flat_body_ang_vel = body_ang_vel.reshape(body_ang_vel.shape[0] * body_ang_vel.shape[1], body_ang_vel.shape[2])
+    flat_local_body_ang_vel = torch_utils.my_quat_rotate(flat_heading_rot_inv, flat_body_ang_vel)
+    local_body_ang_vel = flat_local_body_ang_vel.reshape(body_ang_vel.shape[0], body_ang_vel.shape[1] * body_ang_vel.shape[2])
+
+    obs_list = []
+    if root_height_obs:
+        obs_list.append(root_h_obs)
+    obs_list += [local_body_pos, local_body_rot_obs, local_body_vel, local_body_ang_vel]
+    
+    if has_smpl_params:
+        obs_list.append(smpl_params)
         
-        joblib.dump(new_motion_out, join(tgt_dir_name, tgt_file_name))
-        joblib.dump(M_new_motion_out, join(tgt_dir_name, "M" + tgt_file_name))
+    if has_limb_weight_params:
+        obs_list.append(limb_weight_params)
+
+    obs = torch.cat(obs_list, dim=-1)
+    return obs
+
+
+def compute_im_obs(root_pos, root_rot, body_pos, body_rot, body_vel, body_ang_vel, ref_body_pos, ref_body_rot, ref_body_vel, ref_body_ang_vel, time_steps, upright):
+    obs = []
+    B, J, _ = body_pos.shape
+
+    if not upright:
+        root_rot = remove_base_rot(root_rot)
+
+    heading_inv_rot = torch_utils.calc_heading_quat_inv(root_rot)
+    heading_rot = torch_utils.calc_heading_quat(root_rot)
+    heading_inv_rot_expand = heading_inv_rot.unsqueeze(-2).repeat((1, body_pos.shape[1], 1)).repeat_interleave(time_steps, 0)
+    heading_rot_expand = heading_rot.unsqueeze(-2).repeat((1, body_pos.shape[1], 1)).repeat_interleave(time_steps, 0)
     
 
+    ##### Body position and rotation differences
+    diff_global_body_pos = ref_body_pos.view(B, time_steps, J, 3) - body_pos.view(B, 1, J, 3)
+    diff_local_body_pos_flat = torch_utils.my_quat_rotate(heading_inv_rot_expand.view(-1, 4), diff_global_body_pos.view(-1, 3))
+
+    body_rot[:, None].repeat_interleave(time_steps, 1)
+    diff_global_body_rot = torch_utils.quat_mul(ref_body_rot.view(B, time_steps, J, 4), torch_utils.quat_conjugate(body_rot[:, None].repeat_interleave(time_steps, 1)))
+    diff_local_body_rot_flat = torch_utils.quat_mul(torch_utils.quat_mul(heading_inv_rot_expand.view(-1, 4), diff_global_body_rot.view(-1, 4)), heading_rot_expand.view(-1, 4))  # Need to be change of basis
+    
+    ##### linear and angular  Velocity differences
+    diff_global_vel = ref_body_vel.view(B, time_steps, J, 3) - body_vel.view(B, 1, J, 3)
+    diff_local_vel = torch_utils.my_quat_rotate(heading_inv_rot_expand.view(-1, 4), diff_global_vel.view(-1, 3))
 
 
+    diff_global_ang_vel = ref_body_ang_vel.view(B, time_steps, J, 3) - body_ang_vel.view(B, 1, J, 3)
+    diff_local_ang_vel = torch_utils.my_quat_rotate(heading_inv_rot_expand.view(-1, 4), diff_global_ang_vel.view(-1, 3))
+    
+
+    ##### body pos + Dof_pos This part will have proper futuers.
+    local_ref_body_pos = ref_body_pos.view(B, time_steps, J, 3) - root_pos.view(B, 1, 1, 3)  # preserves the body position
+    local_ref_body_pos = torch_utils.my_quat_rotate(heading_inv_rot_expand.view(-1, 4), local_ref_body_pos.view(-1, 3))
+
+    local_ref_body_rot = torch_utils.quat_mul(heading_inv_rot_expand.view(-1, 4), ref_body_rot.view(-1, 4))
+    local_ref_body_rot = torch_utils.quat_to_tan_norm(local_ref_body_rot)
+
+    # make some changes to how futures are appended.
+    obs.append(diff_local_body_pos_flat.view(B, time_steps, -1))  # 1 * timestep * 24 * 3
+    obs.append(torch_utils.quat_to_tan_norm(diff_local_body_rot_flat).view(B, time_steps, -1))  #  1 * timestep * 24 * 6
+    obs.append(diff_local_vel.view(B, time_steps, -1))  # timestep  * 24 * 3
+    obs.append(diff_local_ang_vel.view(B, time_steps, -1))  # timestep  * 24 * 3
+    obs.append(local_ref_body_pos.view(B, time_steps, -1))  # timestep  * 24 * 3
+    obs.append(local_ref_body_rot.view(B, time_steps, -1))  # timestep  * 24 * 6
+
+    obs = torch.cat(obs, dim=-1).view(B, -1)
+    return obs
 
 
+def motion2obs(current_states, agent):
+    root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, smpl_params, \
+        limb_weights, pose_aa, rb_pos, rb_rot, body_vel, body_ang_vel = \
+            current_states["root_pos"], current_states["root_rot"], current_states["dof_pos"], current_states["root_vel"], current_states["root_ang_vel"], current_states["dof_vel"], current_states["motion_bodies"], \
+                current_states["motion_limb_weights"], current_states["motion_aa"], current_states["rg_pos"], current_states["rb_rot"], current_states["body_vel"], current_states["body_ang_vel"]
+    return compute_obs(rb_pos, rb_rot, body_vel, body_ang_vel, smpl_params, limb_weights, agent._local_root_obs, agent._root_height_obs, agent._has_upright_start, agent._has_shape_obs, agent._has_limb_weight_obs)
+
+
+if __name__ == "__main__":
+
+    # Custom
+    cfg = parse_args()
+    if cfg.vis_gpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cfg.vis_gpu
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    
+    set_seed(cfg.TEST.SEED_VALUE)
+
+    name_time_str = osp.join(cfg.NAME, datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S"))
+    output_dir = osp.join(cfg.FOLDER, name_time_str)
+    os.makedirs(output_dir, exist_ok=False)
+
+    steam_handler = logging.StreamHandler(sys.stdout)
+    file_handler = logging.FileHandler(osp.join(output_dir, 'output.log'))
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+                        datefmt="%m/%d/%Y %H:%M:%S",
+                        handlers=[steam_handler, file_handler])
+    logger = logging.getLogger(__name__)
+
+    OmegaConf.save(cfg, osp.join(output_dir, 'config.yaml'))
+
+    logger.info(f"device: {device}")
+
+    # # Data preprocessing
+    # tgt_dir_name = '/ailab/user/henantian/code/ConFiMo/pulse_data/motion'
+    # os.makedirs(tgt_dir_name, exist_ok=True)
+
+    # index_file = pd.read_csv('/ailab/user/henantian/code/ConFiMo/index.csv')
+    # total_amount = index_file.shape[0]
+
+    # for i in tqdm(range(total_amount)):
+    #     src_path = index_file.loc[i]['source_path']
+    #     tgt_file_name = index_file.loc[i]['new_name'].replace('.npy', '.pkl')
+    #     if "humanact12" in src_path:
+    #         src_path = src_path.replace('pose_data', 'amass_data').replace('.npy', '.pkl')
+    #         new_motion_out, M_new_motion_out = store_motion_humanact12(src_path)
+    #     else:
+    #         # continue    # Below has been excuted before
+    #         src_path = index_file.loc[i]['source_path'].replace('pose_data', 'amass_data').replace('.npy', '.npz')
+    #         new_motion_out, M_new_motion_out = store_motion(src_path)
+        
+    #     joblib.dump(new_motion_out, join(tgt_dir_name, tgt_file_name))
+    #     joblib.dump(M_new_motion_out, join(tgt_dir_name, "M" + tgt_file_name))
+    
+    # motion_set = {}
+    # save_dir_name = '/ailab/user/henantian/code/ConFiMo/pulse_data'
+    # for filename in tqdm(os.listdir(tgt_dir_name)):
+    #     key = filename.split('.')[0]
+    #     motion_set[key] = join(tgt_dir_name, filename)
+    # joblib.dump(motion_set, join(save_dir_name, 'motion_set.pkl'))
+    # logger.info('data saved')
+
+    # Motion imitation
+    encoder, decoder = load_encoder_decoder(cfg, device)
+    logger.info('PULSE loaded')
+
+    flags.debug, flags.follow, flags.fixed, flags.divide_group, flags.no_collision_check, flags.fixed_path, flags.real_path,  flags.show_traj, flags.server_mode, flags.slow, flags.real_traj, flags.im_eval, flags.no_virtual_display, flags.render_o3d = \
+        cfg.debug, cfg.follow, False, False, False, False, False, True, cfg.server_mode, False, False, cfg.im_eval, cfg.no_virtual_display, cfg.render_o3d
+
+    flags.test = True
+    flags.add_proj = cfg.add_proj
+    flags.has_eval = cfg.has_eval
+    flags.trigger_input = False
+
+    sim_params = parse_sim_params(cfg)
+    agent = HumanoidZ(cfg, sim_params, gymapi.SIM_PHYSX, "cuda", 0, cfg.headless)
+    agent.initialize_z_models(encoder, decoder)
+    obs_mean, obs_std = agent.running_mean.float(), torch.sqrt(agent.running_var.float())
+    
+    env_ids = torch.arange(agent.num_envs, dtype=torch.long, device=device)
+    agent.reset(env_ids)
+
+    motion_lib_cfg = EasyDict({
+        "motion_file": cfg.MOTION_DIR,
+        "device": device,
+        "fix_height": FixHeightMode.full_fix,
+        "min_length": -1,
+        "max_length": -1,
+        "im_eval": flags.im_eval,
+        "multi_thread": True ,
+        "smpl_type": 'smpl',
+        "randomrize_heading": True
+    })
+    motion_lib = MotionLibSMPL(motion_lib_cfg)
+    # st()
+    num_motions = motion_lib._num_unique_motions
+    num_envs = agent.num_envs
+    start_idxes = range(0, num_motions, num_envs)
+    logger.info(f"num_motions: {num_motions}\nnum_envs: {num_envs}\nmotion sampling iterations: {len(start_idxes)}")
+
+    for start_idx in start_idxes:
+
+        print(f"########## Motion sampling procedure: {start_idx}/{len(start_idxes)} ##########")
+
+        motion_lib.load_motions(skeleton_trees=agent.skeleton_trees, 
+                                gender_betas=agent.humanoid_shapes.cpu(), 
+                                limb_weights=agent.humanoid_limb_and_weights.cpu(), 
+                                random_sample=False, 
+                                start_idx=start_idx,
+                                max_len=-1, 
+                                num_jobs=1)
+        dts = motion_lib._motion_dt
+        total_lengths = motion_lib._motion_lengths
+        num_frames = motion_lib._motion_num_frames
+        max_num_frame = num_frames.max()
+
+        timesteps = torch.zeros(size=(agent.num_envs,), dtype=torch.float32, device=device)
+        current_states = motion_lib.get_motion_state(motion_lib.motion_ids, timesteps)
+
+        ## Set the state of robots consistency with the initial motion
+        root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, smpl_params, \
+            limb_weights, pose_aa, rb_pos, rb_rot, body_vel, body_ang_vel = \
+                current_states["root_pos"], current_states["root_rot"], current_states["dof_pos"], current_states["root_vel"], current_states["root_ang_vel"], current_states["dof_vel"], current_states["motion_bodies"], \
+                    current_states["motion_limb_weights"], current_states["motion_aa"], current_states["rg_pos"], current_states["rb_rot"], current_states["body_vel"], current_states["body_ang_vel"]
+        agent._set_env_state(env_ids=env_ids, root_pos=root_pos, root_rot=root_rot, dof_pos=dof_pos, root_vel=root_vel, root_ang_vel=root_ang_vel, dof_vel=dof_vel, rigid_body_pos=rb_pos, rigid_body_rot=rb_rot, rigid_body_vel=body_vel, rigid_body_ang_vel=body_ang_vel)
+        agent._reset_env_tensors(env_ids)
+        agent.obs_buf = agent._compute_observations(env_ids)
+
+        # test
+        obs_0 = agent._compute_observations(env_ids)
+        
+        # masks = torch.ones(size=(agent.num_envs,), dtype=torch.float32, device=device)
+
+        for next_frame in range(1, max_num_frame - 1): # As we cannot compute the velocity of the last frame 
+            masks = num_frames > next_frame + 1
+            timesteps = masks * (timesteps + dts)
+            next_states = motion_lib.get_motion_state(motion_lib.motion_ids, timesteps)
+
+            root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, smpl_params, \
+                limb_weights, pose_aa, rb_pos, rb_rot, body_vel, body_ang_vel = \
+                    current_states["root_pos"], current_states["root_rot"], current_states["dof_pos"], current_states["root_vel"], current_states["root_ang_vel"], current_states["dof_vel"], current_states["motion_bodies"], \
+                        current_states["motion_limb_weights"], current_states["motion_aa"], current_states["rg_pos"], current_states["rb_rot"], current_states["body_vel"], current_states["body_ang_vel"]
+
+            # test
+            next_obs_im = motion2obs(next_states, agent)
+
+            im_obs = compute_im_obs(
+                root_pos=agent._rigid_body_pos[:, 0], 
+                root_rot=agent._rigid_body_rot[:, 0], 
+                body_pos=agent._rigid_body_pos, 
+                body_rot=agent._rigid_body_rot, 
+                body_vel=agent._rigid_body_vel, 
+                body_ang_vel=agent._rigid_body_ang_vel, 
+                ref_body_pos=rb_pos.unsqueeze(1), 
+                ref_body_rot=rb_rot.unsqueeze(1), 
+                ref_body_vel=body_vel.unsqueeze(1), 
+                ref_body_ang_vel=body_ang_vel.unsqueeze(1), 
+                time_steps=1, 
+                upright=upright_start
+            )
+
+            encoder_input = (torch.cat([agent.obs_buf, im_obs], dim=-1) - obs_mean) / (obs_std + 1e-05)
+            encoder_latent = encoder.encoder(encoder_input)
+            action_z = encoder.z_mu(encoder_latent)
+            # action_z = decoder.z_prior_mu(decoder.z_prior((agent.obs_buf - obs_mean[:358]) / (obs_std[:358] + 1e-5)))
+
+            agent.step_z(action_z)
+
+            # test
+            next_obs = agent._compute_observations(env_ids)
+            st()
+
+
+    # st()
+
+    # init_state = agent.reset()
+    # print(init_state.size(), init_state)
+    # step_state = agent.step_z(torch.zeros(size=(2, 32)).cuda())
+    # print(step_state.size(), step_state)
+    # print(agent.get_obs_size())
+    # print(agent.get_action_size())
+    # print(agent.get_dof_action_size())
+    # print(agent.get_num_actors_per_env())

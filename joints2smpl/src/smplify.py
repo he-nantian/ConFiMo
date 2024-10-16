@@ -4,7 +4,7 @@ import pickle
 import smplx
 import numpy as np
 import time
-from matplotlib import pyplot as plt
+# from matplotlib import pyplot as plt
 
 sys.path.append(os.path.dirname(__file__))
 from customloss import (camera_fitting_loss, 
@@ -111,9 +111,9 @@ class SMPLify3D():
             camera_translation: Camera translation
         """
 
-        plt.figure()
-        plt.xlabel('iteration'); plt.ylabel('loss')
-        loss_list = []
+        # plt.figure()
+        # plt.xlabel('iteration'); plt.ylabel('loss')
+        # loss_list = []
         
         # # # add the mesh inter-section to avoid
         search_tree = None
@@ -258,7 +258,7 @@ class SMPLify3D():
                                             use_collision=self.use_collision, 
                                             model_vertices=model_vertices, model_faces=self.model_faces,
                                             search_tree=search_tree,  pen_distance=pen_distance,  filter_faces=filter_faces)
-                loss_list.append(loss.item())
+                # loss_list.append(loss.item())
                 body_optimizer.zero_grad()
                 loss.backward()
                 body_optimizer.step()
@@ -283,8 +283,8 @@ class SMPLify3D():
         pose = torch.cat([global_orient, body_pose], dim=-1).detach()
         betas = betas.detach()
 
-        plt.plot(loss_list)
-        plt.savefig(f'/ailab/user/henantian/code/ConFiMo/temp_data/{seq_ind}.png')
-        plt.close()
+        # plt.plot(loss_list)
+        # plt.savefig(f'/ailab/user/henantian/code/ConFiMo/temp_data/{seq_ind}.png')
+        # plt.close()
 
         return vertices, joints, pose, betas, camera_translation, final_loss

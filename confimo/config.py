@@ -56,8 +56,14 @@ def parse_args() -> DictConfig:
     if args.cfg == "configs/motionlcm_t2m.yaml":
         cfg_model.scheduler.num_inference_timesteps = args.num_sampling
         # import pdb; pdb.set_trace()
-
+    
     cfg = OmegaConf.merge(cfg, cfg_model)
+
+    if args.cfg == "configs/pulse.yaml":
+        cfg_env = get_module_config(cfg.env, cfg.env.target)
+        cfg_robot = get_module_config(cfg.robot, cfg.robot.target)
+        cfg_sim = get_module_config(cfg.sim, cfg.sim.target)
+        cfg = OmegaConf.merge(cfg, cfg_env, cfg_robot, cfg_sim)
     # import pdb; pdb.set_trace()
 
     cfg.example = args.example

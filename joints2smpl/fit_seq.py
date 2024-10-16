@@ -71,6 +71,15 @@ total_num = len(dataset)
 end_idx = min(opt.start_idx + opt.num_data, total_num)
 dataset = dataset[opt.start_idx:end_idx]
 
+# # #-------------initialize SMPLify
+smplify = SMPLify3D(smplxmodel=smplmodel,
+					batch_size=opt.batchSize,
+					joints_category=opt.joint_category,
+					num_iters=opt.num_smplify_iters,
+					device=device, 
+					use_lbfgs=False)
+#print("initialize SMPLify3D done!")
+
 for data, purename in dataset:
 
 	# dir_save = os.path.join(opt.save_folder, purename)
@@ -101,6 +110,7 @@ for data, purename in dataset:
 			pred_betas[0, :] = torch.from_numpy(param['beta']).unsqueeze(0).float()
 			pred_pose[0, :] = torch.from_numpy(param['pose']).unsqueeze(0).float()
 			pred_cam_t[0, :] = torch.from_numpy(param['cam']).unsqueeze(0).float()
+			smplify.num_iters = int(opt.num_smplify_iters / 5)
 			
 		if opt.joint_category =="AMASS":
 			confidence_input =  torch.ones(opt.num_joints)
@@ -112,16 +122,7 @@ for data, purename in dataset:
 				confidence_input[11] = 1.5
 		else:
 			print("Such category not settle down!")
-		
-		# # #-------------initialize SMPLify
-		num_smplify_iters = opt.num_smplify_iters if idx == 0 else int(opt.num_smplify_iters / 5)
-		smplify = SMPLify3D(smplxmodel=smplmodel,
-							batch_size=opt.batchSize,
-							joints_category=opt.joint_category,
-							num_iters=num_smplify_iters,
-							device=device, 
-							use_lbfgs=False)
-		#print("initialize SMPLify3D done!")
+
 		# ----- from initial to fitting -------
 		new_opt_vertices, new_opt_joints, new_opt_pose, new_opt_betas, \
 		new_opt_cam_t, new_opt_joint_loss = smplify(
