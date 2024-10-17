@@ -13,3 +13,4 @@ pulse_data/
 temp_data/
 
 *.pkl
+*.png

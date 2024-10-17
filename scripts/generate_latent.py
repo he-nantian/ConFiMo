@@ -46,6 +46,7 @@ from phc.utils.motion_lib_base import FixHeightMode
 from pdb import set_trace as st
 from phc.utils import torch_utils
 from isaacgym.torch_utils import *
+import shutil
 
 
 upright_start = True
@@ -577,6 +578,24 @@ if __name__ == "__main__":
     # joblib.dump(motion_set, join(save_dir_name, 'motion_set.pkl'))
     # logger.info('data saved')
 
+    # # Motion clean
+    # logger.info("Removing motion file with less than 10 frames...")
+    # tmp_dir = "/ailab/user/henantian/code/ConFiMo/pulse_data/tiny_motion"
+    # os.makedirs(tmp_dir, exist_ok=True)
+    # motion_path_storer = joblib.load(cfg.MOTION_DIR)
+    # key_lst = []
+    # for motion_key, motion_path in tqdm(motion_path_storer.items()):
+    #     tmp_motion = joblib.load(motion_path)
+    #     if tmp_motion['pose_aa'].shape[0] < 10:
+    #         key_lst.append(motion_key)
+    #         shutil.move(motion_path, tmp_dir)
+    #         print(f"Motion {motion_key} has been moved!")
+    # print("Updating motion_path_storer...")
+    # for k in key_lst:
+    #     val = motion_path_storer.pop(k)
+    #     print(val)
+    # joblib.dump(motion_path_storer, cfg.MOTION_DIR)
+
     # Motion imitation
     encoder, decoder = load_encoder_decoder(cfg, device)
     logger.info('PULSE loaded')
@@ -615,9 +634,10 @@ if __name__ == "__main__":
     start_idxes = range(0, num_motions, num_envs)
     logger.info(f"num_motions: {num_motions}\nnum_envs: {num_envs}\nmotion sampling iterations: {len(start_idxes)}")
 
-    for start_idx in start_idxes:
-
-        print(f"########## Motion sampling procedure: {start_idx}/{len(start_idxes)} ##########")
+    latent_dir = cfg.latent_dir
+    os.makedirs(latent_dir, exist_ok=True)
+    
+    for process_id, start_idx in enumerate(start_idxes):
 
         motion_lib.load_motions(skeleton_trees=agent.skeleton_trees, 
                                 gender_betas=agent.humanoid_shapes.cpu(), 
@@ -631,6 +651,16 @@ if __name__ == "__main__":
         num_frames = motion_lib._motion_num_frames
         max_num_frame = num_frames.max()
 
+        current_keys = motion_lib.curr_motion_keys
+        if_continue = True
+        for key in current_keys:
+            if not os.path.exists(join(latent_dir, f"{key}.npy")):
+                if_continue = False
+                break
+        if if_continue:
+            print(f"Already processed:\n{current_keys}")
+            continue
+
         timesteps = torch.zeros(size=(agent.num_envs,), dtype=torch.float32, device=device)
         current_states = motion_lib.get_motion_state(motion_lib.motion_ids, timesteps)
 
@@ -642,24 +672,31 @@ if __name__ == "__main__":
         agent._set_env_state(env_ids=env_ids, root_pos=root_pos, root_rot=root_rot, dof_pos=dof_pos, root_vel=root_vel, root_ang_vel=root_ang_vel, dof_vel=dof_vel, rigid_body_pos=rb_pos, rigid_body_rot=rb_rot, rigid_body_vel=body_vel, rigid_body_ang_vel=body_ang_vel)
         agent._reset_env_tensors(env_ids)
         agent.obs_buf = agent._compute_observations(env_ids)
-
-        # test
-        obs_0 = agent._compute_observations(env_ids)
         
         # masks = torch.ones(size=(agent.num_envs,), dtype=torch.float32, device=device)
 
-        for next_frame in range(1, max_num_frame - 1): # As we cannot compute the velocity of the last frame 
-            masks = num_frames > next_frame + 1
+        # ## For test
+        # from matplotlib import pyplot as plt
+        # diff, diff2 = [], []
+
+        z_seqs = np.zeros((num_envs, max_num_frame - 2, 32))
+
+        for frame_id, next_frame in enumerate(range(1, max_num_frame - 1)): # As we cannot compute the velocity of the last frame 
+            
+            print(f"########## Motion sampling procedure: {process_id}/{len(start_idxes)} ##########")
+            print(f"##### Imitation procedure: {frame_id}/{max_num_frame-2} #####")
+
+            masks = num_frames > next_frame + 1    # (num_envs,)
             timesteps = masks * (timesteps + dts)
             next_states = motion_lib.get_motion_state(motion_lib.motion_ids, timesteps)
 
             root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, smpl_params, \
                 limb_weights, pose_aa, rb_pos, rb_rot, body_vel, body_ang_vel = \
-                    current_states["root_pos"], current_states["root_rot"], current_states["dof_pos"], current_states["root_vel"], current_states["root_ang_vel"], current_states["dof_vel"], current_states["motion_bodies"], \
-                        current_states["motion_limb_weights"], current_states["motion_aa"], current_states["rg_pos"], current_states["rb_rot"], current_states["body_vel"], current_states["body_ang_vel"]
+                    next_states["root_pos"], next_states["root_rot"], next_states["dof_pos"], next_states["root_vel"], next_states["root_ang_vel"], next_states["dof_vel"], next_states["motion_bodies"], \
+                        next_states["motion_limb_weights"], next_states["motion_aa"], next_states["rg_pos"], next_states["rb_rot"], next_states["body_vel"], next_states["body_ang_vel"]
 
-            # test
-            next_obs_im = motion2obs(next_states, agent)
+            # # For test
+            # next_obs_im = motion2obs(next_states, agent)
 
             im_obs = compute_im_obs(
                 root_pos=agent._rigid_body_pos[:, 0], 
@@ -678,14 +715,52 @@ if __name__ == "__main__":
 
             encoder_input = (torch.cat([agent.obs_buf, im_obs], dim=-1) - obs_mean) / (obs_std + 1e-05)
             encoder_latent = encoder.encoder(encoder_input)
-            action_z = encoder.z_mu(encoder_latent)
+
+            action_z = encoder.z_mu(encoder_latent)    # (num_envs, 32)
+
+            ## For test
+            # action_mu, action_logvar = encoder.z_mu(encoder_latent), encoder.z_logvar(encoder_latent)
+            # action_z = action_mu + torch.randn_like(action_mu) * torch.exp(action_logvar * 0.5)
+            
             # action_z = decoder.z_prior_mu(decoder.z_prior((agent.obs_buf - obs_mean[:358]) / (obs_std[:358] + 1e-5)))
+
+            # action_z = -encoder.z_mu(encoder_latent)
+
+            # action_z = torch.randn(size=(1, 32), dtype=torch.float32, device=device)
+
+            # action_z = torch.zeros(size=(1, 32), dtype=torch.float32, device=device)
 
             agent.step_z(action_z)
 
-            # test
-            next_obs = agent._compute_observations(env_ids)
-            st()
+            true_idx = [i for i, val in enumerate(masks) if val]
+            z_seqs[true_idx, frame_id] = action_z[true_idx].detach().numpy()
+        
+        for key, z_seq, num_frame in zip(current_keys, z_seqs, num_frames):
+            np.save(join(latent_dir, f"{key}.npy"), z_seq[:num_frame-2])
+        
+    logger.info("Latent dataset has been constructed!")
+        
+        # st()
+
+        #     # For test
+        #     next_obs = agent._compute_observations(env_ids)
+        #     temp = float((next_obs_im[0]-next_obs[0]).abs().mean().detach())
+        #     diff.append(temp)
+        #     temp2 = float((next_obs[0][:1]).abs().mean().detach())
+        #     diff2.append(temp2)
+        
+        # # st()
+        # plt.figure()
+        # plt.plot(diff)
+        # plt.savefig('tmp_neg.png')
+        # plt.close()
+        # plt.figure()
+        # plt.plot(diff2)
+        # plt.savefig('tmp_neg2.png')
+        # plt.close()
+        # break
+            
+
 
 
     # st()

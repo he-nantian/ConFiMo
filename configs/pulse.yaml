@@ -61,3 +61,5 @@ real_traj: False
 im_eval: False
 
 MOTION_DIR: '/ailab/user/henantian/code/ConFiMo/pulse_data/motion_set.pkl'
+
+latent_dir: '/ailab/user/henantian/code/ConFiMo/pulse_data/latent'

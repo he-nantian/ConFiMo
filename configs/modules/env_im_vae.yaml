@@ -1,7 +1,7 @@
 # if given, will override the device setting in gym. 
 task: HumanoidImDistillGetup
 motion_file: ""
-num_envs: 28
+num_envs: 28    # 28
 env_spacing: 5
 
 # env_spacing: 0.5
